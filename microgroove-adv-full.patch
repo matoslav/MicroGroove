@@ -1,0 +1,868 @@
+diff --git a/Microgroove.ino b/Microgroove.ino
+index 1992a46..b0855fb 100644
+--- a/Microgroove.ino
++++ b/Microgroove.ino
+@@ -15,6 +15,7 @@
+ #include <M5Cardputer.h>
+ #include <SPI.h>
+ #include <SD.h>
++#include <math.h>
+ 
+ #include "config.h"
+ #include "sequencer.h"
+@@ -25,6 +26,34 @@
+ #include "mic_sampler.h"
+ #include "ui.h"
+ 
++// ===================== MOTION / IMU TUNING =========================
++// All the "feel" knobs for the tilt controls live here. Angles are in
++// degrees of tilt away from the flat/neutral position learned at boot.
++//
++// Cutoff  (LEFT / RIGHT tilt):
++#define MOT_CUT_DEADZONE    7.0f    // within +/- this angle, keep the SOUND-page cutoff
++#define MOT_CUT_SPAN       33.0f    // degrees from deadzone edge to fully open / shut
++#define MOT_CUT_SIGN      (+1.0f)   // set to -1.0f to reverse which side opens the filter
++//
++// Stutter bands — tilt toward the STUTTER side (degrees from neutral):
++#define MOT_STUTTER_DEADZONE  20.0f   // within +/- this: no stutter
++#define MOT_STUTTER_BAND2     35.0f   // reach level 2 here (1/16)
++#define MOT_STUTTER_BAND3     50.0f   // reach level 3 here (1/32)
++//
++// Probability bands — tilt toward the PROBABILITY side (degrees from neutral):
++#define MOT_PROB_DEADZONE     20.0f   // within +/- this: no thinning
++#define MOT_PROB_BAND2        35.0f   // reach 70% here
++#define MOT_PROB_BAND3        50.0f   // reach 50% here
++//
++// Front/back axis orientation. The BMI270 sign can differ between units: if
++// "TOWARD YOU" and "AWAY" come out swapped for you, flip this (1 <-> 0).
++#define MOT_PITCH_INVERT      1       // 1 = invert the front/back axis
++//
++// Response feel:
++#define MOT_SMOOTH         0.15f    // tilt smoothing 0..1 (lower = smoother / slower)
++#define MOT_CAL_FRAMES     30       // frames averaged at boot to learn "flat"
++// ===================================================================
++
+ void inputInit();
+ void inputUpdate();
+ 
+@@ -58,7 +87,11 @@ void setup() {
+         wavetableLoadUserFromSD();
+     }
+     sequencerInit();
+-    loadDemoPattern();
++    // Boot into the last project you saved; if there's no marker or it won't
++    // load, sequencerInit already left an empty pattern (no demo).
++    int lastSlot = s_sdOk ? storageLastSlot() : -1;
++    if (lastSlot >= 0 && storageLoadProject((uint8_t)lastSlot))
++        g_curProject = (uint8_t)lastSlot;
+ 
+     uiSplash();
+     while (true) {
+@@ -75,9 +108,84 @@ void setup() {
+     g_needRedraw = true;
+ }
+ 
++// --- Stage 1 motion control: tilt FORWARD/BACK (pitch) -> filter cutoff of the
++// selected synth track. Neutral is captured at boot (rest flat on the desk).
++// Inside a deadzone the track keeps its SOUND-page cutoff; past it, tilt acts as
++// an absolute filter control: forward opens toward fully open, back closes toward
++// shut. Tuned from measured device: usable pitch ~ +/-40 deg, rock-stable at rest.
++static void motionUpdate() {
++    static bool  smInit = false;
++    static float ax = 0, ay = 0, az = 1;
++    static bool  calDone = false;
++    static float pSum = 0, bSum = 0, p0 = 0, b0 = 0;
++    static int   calN = 0;
++
++    if (!M5.Imu.isEnabled()) { g_motionTrack = -1; g_motionCut = 0.0f; g_stutterRate = 0; g_stepProb = 100; return; }
++
++    float rx, ry, rz;
++    M5.Imu.update();
++    M5.Imu.getAccel(&rx, &ry, &rz);
++    if (!smInit) { ax = rx; ay = ry; az = rz; smInit = true; }
++    const float k = MOT_SMOOTH;                    // one-pole smoothing
++    ax += (rx - ax) * k; ay += (ry - ay) * k; az += (rz - az) * k;
++
++    // Two orthogonal tilt axes:
++    //   cut = LEFT/RIGHT -> filter cutoff (unchanged, you liked it)
++    //   stu = FRONT/BACK -> stutter / beat-repeat
++    float cut = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.2958f;
++    float stu = atan2f(ay, az) * 57.2958f;
++
++    if (!calDone) {                               // learn both resting neutrals (~30 frames)
++        pSum += cut; bSum += stu; calN++;
++        if (calN >= MOT_CAL_FRAMES) { p0 = pSum / calN; b0 = bSum / calN; calDone = true; }
++        g_motionTrack = -1; g_motionCut = 0.0f; g_stutterRate = 0; g_stepProb = 100;
++        return;
++    }
++
++    if (!g_motion.enabled) {                      // MOTION page master switch
++        g_motionTrack = -1; g_motionCut = 0.0f; g_stutterRate = 0; g_stepProb = 100;
++        return;
++    }
++
++    // --- cutoff (left/right): unchanged behaviour ---
++    const float C_SIGN = MOT_CUT_SIGN;
++    const float C_DZ   = MOT_CUT_DEADZONE;
++    const float C_SPAN = MOT_CUT_SPAN;
++    float dc = (cut - p0) * C_SIGN;
++    float pos = 0.0f;
++    float ac = fabsf(dc) - C_DZ;
++    if (ac > 0.0f) {
++        if (ac > C_SPAN) ac = C_SPAN;
++        pos = ac / C_SPAN;
++        if (dc < 0.0f) pos = -pos;
++    }
++    g_motionCut   = pos;
++    g_motionTrack = (g_curTrack < NUM_SYNTHS) ? (int)g_curTrack : -1;
++
++    // --- stutter vs step-probability on the front/back axis ---
++    // STU END picks which tilt end is the stutter; the opposite end thins the steps.
++    float axis = (stu - b0) * (MOT_PITCH_INVERT ? -1.0f : +1.0f);   // correct this unit's axis sign
++    float sign = (g_motion.stutterEnd == 0) ? +1.0f : -1.0f;        // 0 = AWAY, 1 = TOWARD YOU
++    float sa = axis * sign;                      // >0 = stutter end, <0 = probability end
++
++    uint8_t rate = 0;
++    if      (sa > MOT_STUTTER_BAND3)    rate = 3;   // 1/32
++    else if (sa > MOT_STUTTER_BAND2)    rate = 2;   // 1/16
++    else if (sa > MOT_STUTTER_DEADZONE) rate = 1;   // 1/8
++    g_stutterRate = rate;
++
++    uint8_t prob = 100;
++    float pb = -sa;                              // opposite end -> thinning
++    if      (pb > MOT_PROB_BAND3)    prob = 50;
++    else if (pb > MOT_PROB_BAND2)    prob = 70;
++    else if (pb > MOT_PROB_DEADZONE) prob = 90;
++    g_stepProb = prob;
++}
++
+ void loop() {
+     inputUpdate();
+     micSamplerUpdate();
++    motionUpdate();
+     sequencerTick();
+ 
+     if (g_needRedraw) {
+diff --git a/audio_engine.cpp b/audio_engine.cpp
+index bc12ebf..b55e68d 100644
+--- a/audio_engine.cpp
++++ b/audio_engine.cpp
+@@ -12,6 +12,12 @@
+ float g_scopeBuf[SCREEN_W];
+ volatile int g_scopeIdx = 0;
+ 
++volatile bool g_audioPaused = false;
++volatile bool g_audioParked = false;
++
++volatile float g_motionCut = 0.0f;
++volatile int   g_motionTrack = -1;
++
+ static int16_t s_bufA[AUDIO_BUF_LEN];
+ static int16_t s_bufB[AUDIO_BUF_LEN];
+ static TaskHandle_t s_task = nullptr;
+@@ -21,13 +27,16 @@ static void audioTask(void*) {
+     int cur = 0;
+ 
+     while (true) {
++        if (g_audioPaused) { g_audioParked = true; vTaskDelay(2); continue; }
++        g_audioParked = false;
+         int16_t* buf = buffers[cur];
+ 
+         for (int i = 0; i < AUDIO_BUF_LEN; i++) {
+             float mix = 0.0f;
+ 
+             for (int s = 0; s < NUM_SYNTHS; s++)
+-                if (!g_synthMute[s]) mix += g_synths[s].render();   // SynthTrack: sums 1..3 voices
++                if (!g_synthMute[s])
++                    mix += g_synths[s].render(s == g_motionTrack ? g_motionCut : 0.0f);
+ 
+             if (!g_drumMute)
+                 for (int d = 0; d < NUM_DRUM_LANES; d++)
+diff --git a/audio_engine.h b/audio_engine.h
+index a843776..d63a12c 100644
+--- a/audio_engine.h
++++ b/audio_engine.h
+@@ -7,4 +7,17 @@
+ extern float g_scopeBuf[SCREEN_W];
+ extern volatile int g_scopeIdx;
+ 
++// Set g_audioPaused=true to park the render task so the codec (ES8311) can be
++// safely re-initialised from the other core (mic start/stop). The task sets
++// g_audioParked=true once it has actually stopped touching the Speaker.
++extern volatile bool g_audioPaused;
++extern volatile bool g_audioParked;
++
++// Motion control (Stage 1): tilt applied to one synth track's filter.
++// g_motionCut is a signed tilt position (-1..+1): 0 keeps the track's own cutoff,
++// >0 opens, <0 closes. g_motionTrack = target synth track (-1 = none).
++// Written by the main loop from the IMU, read by the render task.
++extern volatile float g_motionCut;
++extern volatile int   g_motionTrack;
++
+ void audioEngineStart();   // creates the render task on core 0
+diff --git a/config.h b/config.h
+index e22499d..0037491 100644
+--- a/config.h
++++ b/config.h
+@@ -57,7 +57,7 @@ enum DrumEngine : uint8_t { ENG_808 = 0, ENG_909, ENG_SMPL, ENG_COUNT };
+ enum DrumType : uint8_t { DT_KICK = 0, DT_SNARE, DT_HAT_C, DT_HAT_O_OR_CLAP, DT_COUNT };
+ // 808 set: KICK SNARE CHAT CLAP  |  909 set: KICK SNARE CHAT OHAT
+ 
+-enum Page : uint8_t { PAGE_PATTERN = 0, PAGE_SOUND, PAGE_SAMPLE, PAGE_SONG, PAGE_HELP, PAGE_COUNT };
++enum Page : uint8_t { PAGE_PATTERN = 0, PAGE_SOUND, PAGE_SAMPLE, PAGE_SONG, PAGE_MOTION, PAGE_HELP, PAGE_COUNT };
+ 
+ // note values 1..12 = C..B, 0 = empty
+ #define NOTE_EMPTY 0
+diff --git a/input.cpp b/input.cpp
+index 0ced029..0a7cb9b 100644
+--- a/input.cpp
++++ b/input.cpp
+@@ -9,6 +9,7 @@
+ //                         then tap a pad to commit
+ // ============================================================
+ #include <M5Cardputer.h>
++#include <SD.h>
+ #include "config.h"
+ #include "keymap.h"
+ #include "sequencer.h"
+@@ -17,12 +18,58 @@
+ #include "wavetable.h"
+ #include "ui.h"
+ #include "mic_sampler.h"
++#include "audio_engine.h"
+ 
+ void inputInit();
+ void inputUpdate();
+ 
+ #define LONG_PRESS_MS 450
+ #define HINT_AFTER_MS 140    // progress bar appears after this
++
++// Unload every sample from the RAM pool (SAMPLE page: CL / Z). The .wav files
++// stay on the SD. Any drum lane that was playing a sample is detached first so
++// the render task never reads freed pool data. Audio is parked during the swap.
++static void clearSampleRAM() {
++    g_audioPaused = true;
++    for (int i = 0; i < 100 && !g_audioParked; i++) vTaskDelay(1);
++    g_previewVoice.stop();
++    for (int d = 0; d < NUM_DRUM_LANES; d++)
++        if (g_drumLanes[d].engine == ENG_SMPL) {
++            g_drumLanes[d].smp.stop();
++            g_drumLanes[d].sampleSlot = -1;
++        }
++    samplerClearAll();                 // pool usage -> 0, registry wiped
++    g_audioPaused = false;
++    uiStatus("RAM CLEARED");
++}
++
++// Audition a sample WITHOUT touching the shared pool: decode it into the
++// temporary mic/resample scratch buffer and point the preview voice there.
++// Previewing another sample just overwrites the scratch, so auditioning never
++// fills RAM. Only assigning a sample to a lane (4..- keys) consumes the pool.
++static void previewSample(const char* name) {
++    if (!g_scratch) { uiStatus("NO PREVIEW BUF"); return; }
++    char path[80];
++    snprintf(path, sizeof(path), "%s/%s", DIR_SAMPLES, name);
++    File f = SD.open(path, FILE_READ);
++    if (!f) { uiStatus("LOAD FAILED"); return; }
++
++    g_previewVoice.active = false;                 // stop reading scratch during the swap
++    uint32_t frames = 0, rate = 0;
++    bool ok = wavDecodeToMono16(f, g_scratch, SCRATCH_FRAMES, frames, rate);
++    f.close();
++
++    if (ok && frames) {
++        g_previewVoice.data = g_scratch;
++        g_previewVoice.len  = frames;
++        g_previewVoice.pos  = 0;
++        g_previewVoice.inc  = (float)rate * INV_SAMPLE_RATE;
++        g_previewVoice.gain = 0.9f;
++        g_previewVoice.active = true;              // set active last
++    } else {
++        uiStatus("LOAD FAILED");
++    }
++}
+ #define RPT_DELAY_MS  350
+ #define RPT_RATE_MS    90
+ 
+@@ -114,6 +161,15 @@ static void adjustDrumParam(uint8_t lane, uint8_t row, int dir, bool fine) {
+ }
+ 
+ // ---------- arrows, per page ----------
++static void adjustMotionParam(uint8_t row, int dx) {
++    switch (row) {
++        case 0: g_motion.enabled = !g_motion.enabled;                 break;  // MOTION on/off
++        case 1: g_motion.stutterEnd ^= 1;                             break;  // STU END FWD/BACK
++        case 2: g_motion.probTarget = (uint8_t)((g_motion.probTarget + 3 + (dx > 0 ? 1 : -1)) % 3); break;
++        case 3: g_motion.probMode ^= 1;                               break;  // RND/BAR
++    }
++}
++
+ static void arrow(uint8_t act, const KeySnap& now) {
+     int dx = (act == ACT_LEFT) ? -1 : (act == ACT_RIGHT) ? 1 : 0;
+     int dy = (act == ACT_UP)   ? -1 : (act == ACT_DOWN)  ? 1 : 0;
+@@ -158,6 +214,11 @@ static void arrow(uint8_t act, const KeySnap& now) {
+             if (dy) g_songCursor = (uint8_t)((g_songCursor + SONG_LENGTH + dy * 16) % SONG_LENGTH);
+             if (dx) g_songCursor = (uint8_t)((g_songCursor + SONG_LENGTH + dx) % SONG_LENGTH);
+             break;
++
++        case PAGE_MOTION:
++            if (dy) g_motionParam = (uint8_t)((g_motionParam + MOTION_PARAMS + dy) % MOTION_PARAMS);
++            if (dx) adjustMotionParam(g_motionParam, dx);
++            break;
+         default: break;
+     }
+     g_needRedraw = true;
+@@ -206,7 +267,12 @@ static void doShort(uint8_t act) {
+                 int slot = samplerLoad(g_fileList[g_fileSel]);
+                 if (slot >= 0) {
+                     DrumLane& d = g_drumLanes[k];
++                    g_audioPaused = true;                 // swap lane state atomically vs render task
++                    for (int i = 0; i < 100 && !g_audioParked; i++) vTaskDelay(1);
++                    d.sv.active  = false;                 // silence old synth-drum voice
++                    d.smp.stop();                         // silence old sample voice
+                     d.engine = ENG_SMPL; d.sampleSlot = (int8_t)slot; d.smp.init();
++                    g_audioPaused = false;
+                     uiStatus("ASSIGNED");
+                 } else uiStatus("LOAD FAILED");
+                 g_needRedraw = true;
+@@ -252,8 +318,9 @@ static void doShort(uint8_t act) {
+             g_needRedraw = true; break;
+ 
+         case ACT_CLR:
+-            if (g_curPage == PAGE_SONG) g_song[g_songCursor] = SONG_EMPTY;
+-            else clearCellAtCursor();
++            if (g_curPage == PAGE_SAMPLE)    clearSampleRAM();
++            else if (g_curPage == PAGE_SONG) g_song[g_songCursor] = SONG_EMPTY;
++            else                             clearCellAtCursor();
+             g_needRedraw = true; break;
+ 
+         case ACT_SONG:
+@@ -263,9 +330,7 @@ static void doShort(uint8_t act) {
+ 
+         case ACT_AUX:
+             if (g_curPage == PAGE_SAMPLE && g_fileCount) {
+-                int slot = samplerLoad(g_fileList[g_fileSel]);
+-                if (slot >= 0) g_previewVoice.trigger(slot, 1.0f, 0.9f);
+-                else uiStatus("LOAD FAILED");
++                previewSample(g_fileList[g_fileSel]);
+                 g_needRedraw = true;
+             } else if (g_curPage == PAGE_SONG) {
+                 g_songLoopStart = g_songCursor;
+@@ -312,6 +377,7 @@ static void doLong(uint8_t act) {
+         case ACT_PLAY:
+             sequencerStart(true); g_needRedraw = true; break;
+         case ACT_CLR:
++            if (g_curPage == PAGE_SAMPLE) break;      // Z here = clear RAM (short press), never wipe pattern
+             memset(&g_patterns[g_curPattern], 0, sizeof(Pattern));
+             uiStatus("PATTERN CLEARED"); g_needRedraw = true; break;
+         case ACT_BPM_DN:
+diff --git a/mic_sampler.cpp b/mic_sampler.cpp
+index c213e0b..67f9dec 100644
+--- a/mic_sampler.cpp
++++ b/mic_sampler.cpp
+@@ -4,6 +4,7 @@
+ #include "mic_sampler.h"
+ #include "sampler.h"
+ #include "sequencer.h"
++#include "audio_engine.h"
+ #include "ui.h"
+ #include <M5Cardputer.h>
+ #include <SD.h>
+@@ -71,8 +72,37 @@ static bool writeWav(const char* name, uint32_t start, uint32_t frames, uint32_t
+ static bool commitToLane(uint8_t lane, const char* base, uint8_t& counter,
+                          uint32_t start, uint32_t frames, uint32_t rate) {
+     if (frames < 64) { uiStatus("TOO QUIET"); return false; }
++    // Find the next free NNxx.wav on the SD so a reboot (which resets `counter`)
++    // never overwrites recordings from an earlier session.
+     char name[SAMPLE_NAME_LEN];
+-    snprintf(name, sizeof(name), "%s%02u.wav", base, (unsigned)(++counter));
++    char probe[80];
++    do {
++        snprintf(name, sizeof(name), "%s%02u.wav", base, (unsigned)(++counter));
++        snprintf(probe, sizeof(probe), "%s/%s", DIR_SAMPLES, name);
++    } while (SD.exists(probe) && counter < 99);
++
++    // Normalize: quiet mic captures otherwise become quiet samples. Amplify the
++    // peak toward ~-1 dBFS, only ever boosting (never attenuating a hot resample)
++    // and with a ceiling so a near-silent take doesn't turn its hiss into a roar.
++    {
++        int32_t pk = 0;
++        for (uint32_t i = 0; i < frames; i++) {
++            int32_t a = g_scratch[start + i]; if (a < 0) a = -a;
++            if (a > pk) pk = a;
++        }
++        if (pk > 0) {
++            float g = (0.9f * 32767.0f) / (float)pk;
++            if (g > 8.0f) g = 8.0f;                 // +18 dB ceiling
++            if (g > 1.0f) {
++                for (uint32_t i = 0; i < frames; i++) {
++                    int32_t v = (int32_t)(g_scratch[start + i] * g);
++                    if      (v >  32767) v =  32767;
++                    else if (v < -32768) v = -32768;
++                    g_scratch[start + i] = (int16_t)v;
++                }
++            }
++        }
++    }
+ 
+     int slot = -1;
+     if (writeWav(name, start, frames, rate)) {
+@@ -99,6 +129,9 @@ static bool commitToLane(uint8_t lane, const char* base, uint8_t& counter,
+ bool micRecStart(uint8_t lane) {
+     if (s_recActive || !g_scratch) return false;
+     sequencerStop();
++    g_previewVoice.stop();              // preview shares the scratch buffer we're about to fill
++    g_audioPaused = true;               // stop the render task touching the codec first
++    for (int i = 0; i < 100 && !g_audioParked; i++) vTaskDelay(1);
+     M5Cardputer.Speaker.end();          // ES8311: avoid duplex contention (verify on hw)
+     M5Cardputer.Mic.begin();
+     s_recLane = lane; s_recActive = true;
+@@ -153,6 +186,7 @@ void micRecStop() {
+     trimScratch(g_scratchWr, MIC_RATE, start, len);
+     if (commitToLane(s_recLane, "MIC", s_micCount, start, len, MIC_RATE))
+         uiStatus("SAMPLED!");
++    g_audioPaused = false;              // codec + sample pool are stable now, resume audio
+     g_needRedraw = true;
+ }
+ 
+diff --git a/sequencer.cpp b/sequencer.cpp
+index 65476e7..fbe6c2b 100644
+--- a/sequencer.cpp
++++ b/sequencer.cpp
+@@ -11,8 +11,8 @@ uint8_t    g_songLoopStart = 0;
+ 
+ SynthTrack g_synths[NUM_SYNTHS];
+ DrumLane   g_drumLanes[NUM_DRUM_LANES];
+-bool       g_synthMute[NUM_SYNTHS] = {false, false, false};
+-bool       g_drumMute = false;
++volatile bool g_synthMute[NUM_SYNTHS] = {false, false, false};
++volatile bool g_drumMute = false;
+ 
+ volatile bool g_playing = false;
+ bool       g_recEnabled = false;
+@@ -21,6 +21,11 @@ uint8_t    g_playStep    = 0;
+ uint8_t    g_playPattern = 0;
+ uint8_t    g_songPos     = 0;
+ uint16_t   g_bpm         = 128;
++uint8_t    g_stutterRate = 0;      // 0 = off, 1 = 1/8, 2 = 1/16, 3 = 1/32 (from tilt)
++uint8_t    g_stepProb    = 100;    // % chance a normal step fires (100 = always); tilt-back thins
++
++MotionCfg  g_motion = { true, 1, 1, 0 };   // enabled, stutter=TOWARD YOU, thin=DRUMS, mode=RANDOM
++uint8_t    g_motionParam = 0;
+ 
+ uint8_t    g_curPattern  = 0;
+ uint8_t    g_curTrack    = 0;
+@@ -40,7 +45,7 @@ void sequencerInit() {
+ 
+     for (int s = 0; s < NUM_SYNTHS; s++) g_synths[s].init();
+     g_synths[0].forEach([](SynthVoice& v){ v.oscMode = OSC_SAW; v.fltCutoff = 0.30f;
+-                                           v.fltReso = 0.45f;   v.fltEnvAmt = 0.60f; });
++                                           v.fltReso = 0.45f;   v.fltEnvAmt = 0.35f; });
+     g_synths[1].forEach([](SynthVoice& v){ v.oscMode = OSC_SQR; v.fltCutoff = 0.45f;
+                                            v.volume  = 0.6f; });
+     g_synths[2].forEach([](SynthVoice& v){ v.oscMode = OSC_WT;  v.wtIndex = 0;
+@@ -73,9 +78,10 @@ static void triggerLane(uint8_t lane) {
+     g_drumLanes[lane].trigger();
+ }
+ 
+-static void triggerStep(uint8_t step) {
+-    Pattern& p = g_patterns[g_playPattern];
++static void triggerStep(uint8_t step, uint8_t pat, bool dropSynth = false, bool dropDrum = false) {
++    Pattern& p = g_patterns[pat];
+ 
++    if (!dropSynth)
+     for (int s = 0; s < NUM_SYNTHS; s++) {
+         if (g_synthMute[s]) continue;
+         const SynthCell& c = p.synth[s][step];
+@@ -86,7 +92,7 @@ static void triggerStep(uint8_t step) {
+                                    c.accent, mono && c.slide);
+     }
+ 
+-    if (!g_drumMute) {
++    if (!dropDrum && !g_drumMute) {
+         uint8_t mask = p.drums[step];
+         for (int l = 0; l < NUM_DRUM_LANES; l++)
+             if (mask & (1 << l)) triggerLane(l);
+@@ -124,20 +130,106 @@ static void songAdvance() {
+     // fallback: stay on current
+ }
+ 
++// A step is worth repeating if any un-muted track actually sounds on it.
++static bool stepSounds(const Pattern& p, uint8_t step) {
++    for (int s = 0; s < NUM_SYNTHS; s++)
++        if (!g_synthMute[s] && !p.synth[s][step].empty()) return true;
++    if (!g_drumMute && p.drums[step]) return true;
++    return false;
++}
++
++// Probability gate for normal playback (tilt thinning). true = let the step fire.
++static bool stepKeeps(uint8_t step) {
++    if (g_stepProb >= 100) return true;
++    if (g_motion.probMode == 1) {                 // BAR: deterministic per step index
++        uint32_t h = step * 2654435761u;          // cheap hash -> stable 0..99 per step
++        return (uint8_t)((h >> 24) % 100) < g_stepProb;
++    }
++    static bool seeded = false;                    // RND: fresh roll each step
++    if (!seeded) { randomSeed(micros()); seeded = true; }
++    return (long)random(100) < (long)g_stepProb;
++}
++
++// Fire a normal (non-stutter) step, thinning only the targeted tracks.
++static void triggerNormal(uint8_t step, uint8_t pat) {
++    bool drop = !stepKeeps(step);
++    bool dropSyn = drop && (g_motion.probTarget == 0 || g_motion.probTarget == 2);
++    bool dropDrm = drop && (g_motion.probTarget == 0 || g_motion.probTarget == 1);
++    triggerStep(step, pat, dropSyn, dropDrm);
++}
++
+ void sequencerTick() {
+     if (!g_playing) return;
+-    uint32_t now = micros();
+-    if (now - s_lastStepUs < s_stepPeriod()) return;
+-    s_lastStepUs += s_stepPeriod();                 // accumulate: no drift
+ 
+-    triggerStep(g_playStep);
+-    g_playStep++;
+-    if (g_playStep >= NUM_STEPS) {
+-        g_playStep = 0;
+-        if (g_songMode) songAdvance();
+-        else            g_playPattern = g_curPattern;  // pattern switch on bar
++    // Stutter release behaviour:
++    //   true  = "to tempo"  : the groove keeps running underneath (silent) while you
++    //                         stutter, so on release it resumes where it would have been.
++    //   false = "freeze"    : hold on the slice; on release continue from that point.
++    const bool STUTTER_TO_TEMPO = true;
++
++    static uint8_t  s_stutterStep   = 0;
++    static uint8_t  s_stutterPat    = 0;
++    static bool     s_wasStuttering = false;
++    static uint32_t s_lastStutterUs = 0;
++
++    uint8_t r = g_stutterRate;                       // 0 off, 1=1/8, 2=1/16, 3=1/32
++    bool stuttering = (r != 0);
++
++    if (stuttering && !s_wasStuttering) {            // just engaged: latch a sounding step
++        Pattern& p = g_patterns[g_playPattern];
++        uint8_t st = (g_playStep == 0) ? (NUM_STEPS - 1) : (g_playStep - 1);  // last played
++        for (int i = 0; i < NUM_STEPS; i++) {        // walk back until one actually sounds
++            if (stepSounds(p, st)) break;
++            st = (st == 0) ? (NUM_STEPS - 1) : (st - 1);
++        }
++        s_stutterStep   = st;
++        s_stutterPat    = g_playPattern;             // latch pattern too (stable across song changes)
++        s_lastStutterUs = s_lastStepUs;              // phase-align to the grid: no stumble on entry
++    }
++    s_wasStuttering = stuttering;
++
++    uint32_t now = micros();
++    uint32_t sp  = s_stepPeriod();                   // stutter repeat period
++    if      (r == 1) sp *= 2;                        // 1/8
++    else if (r == 3) sp /= 2;                        // 1/32
++
++    if (STUTTER_TO_TEMPO) {
++        // (1) real song clock: always advances on the 1/16 grid; audible only when
++        //     not stuttering, so the timeline keeps its place underneath.
++        if (now - s_lastStepUs >= s_stepPeriod()) {
++            s_lastStepUs += s_stepPeriod();
++            if (!stuttering) triggerNormal(g_playStep, g_playPattern);
++            g_playStep++;
++            if (g_playStep >= NUM_STEPS) {
++                g_playStep = 0;
++                if (g_songMode) songAdvance();
++                else            g_playPattern = g_curPattern;
++            }
++            g_needRedraw = true;
++        }
++        // (2) stutter sub-clock: repeat the latched slice at the chosen rate.
++        if (stuttering && now - s_lastStutterUs >= sp) {
++            s_lastStutterUs += sp;
++            triggerStep(s_stutterStep, s_stutterPat);
++        }
++    } else {
++        // freeze variant: hold the slice, don't advance the timeline.
++        uint32_t period = stuttering ? sp : s_stepPeriod();
++        if (now - s_lastStepUs < period) return;
++        s_lastStepUs += period;
++        if (stuttering) {
++            triggerStep(s_stutterStep, s_stutterPat);
++        } else {
++            triggerNormal(g_playStep, g_playPattern);
++            g_playStep++;
++            if (g_playStep >= NUM_STEPS) {
++                g_playStep = 0;
++                if (g_songMode) songAdvance();
++                else            g_playPattern = g_curPattern;
++            }
++        }
++        g_needRedraw = true;
+     }
+-    g_needRedraw = true;
+ }
+ 
+ // ---------- live input ----------
+diff --git a/sequencer.h b/sequencer.h
+index a0c6aa6..86550bf 100644
+--- a/sequencer.h
++++ b/sequencer.h
+@@ -68,10 +68,10 @@ struct SynthTrack {
+         v[pick].noteOn(freq, acc, false);                  // no slide in poly
+     }
+ 
+-    inline float render() {
+-        if (voices <= 1) return v[0].render();
++    inline float render(float cutPos = 0.0f) {
++        if (voices <= 1) return v[0].render(cutPos);
+         float s = 0;
+-        for (int i = 0; i < voices; i++) s += v[i].render();
++        for (int i = 0; i < voices; i++) s += v[i].render(cutPos);
+         return s * (voices > 2 ? 0.62f : 0.75f);           // headroom vs. clip
+     }
+ };
+@@ -88,8 +88,8 @@ extern uint8_t    g_songLoopStart;
+ 
+ extern SynthTrack g_synths[NUM_SYNTHS];
+ extern DrumLane   g_drumLanes[NUM_DRUM_LANES];
+-extern bool       g_synthMute[NUM_SYNTHS];
+-extern bool       g_drumMute;
++extern volatile bool g_synthMute[NUM_SYNTHS];
++extern volatile bool g_drumMute;
+ 
+ // transport
+ extern volatile bool g_playing;
+@@ -99,6 +99,19 @@ extern uint8_t    g_playStep;
+ extern uint8_t    g_playPattern;    // pattern currently sounding
+ extern uint8_t    g_songPos;
+ extern uint16_t   g_bpm;
++extern uint8_t    g_stutterRate;    // 0 = off, 1 = 1/8, 2 = 1/16, 3 = 1/32 (set from IMU tilt)
++extern uint8_t    g_stepProb;       // % a normal step fires (100 = always); tilt-back thins
++
++// Motion / IMU performance config (edited on the MOTION page, RAM for now).
++struct MotionCfg {
++    bool    enabled;      // master on/off for all IMU control
++    uint8_t stutterEnd;   // 0 = FWD, 1 = BACK  (which tilt end is the stutter; other end = prob)
++    uint8_t probTarget;   // 0 = ALL, 1 = DRUM, 2 = SYNTH
++    uint8_t probMode;     // 0 = RND (per step), 1 = BAR (locked per step index)
++};
++extern MotionCfg  g_motion;
++extern uint8_t    g_motionParam;    // cursor row on the MOTION page
++#define MOTION_PARAMS 4
+ 
+ // edit state
+ extern uint8_t    g_curPattern;     // pattern being edited/viewed
+diff --git a/storage.cpp b/storage.cpp
+index 750d7fb..85677bf 100644
+--- a/storage.cpp
++++ b/storage.cpp
+@@ -11,7 +11,7 @@
+ uint8_t g_curProject = 0;
+ 
+ #define GBX_MAGIC   0x31584247u   // "GBX1"
+-#define GBX_VERSION 2             // v2: polyphonic cells + per-track VOICES
++#define GBX_VERSION 3             // v3: + motion/IMU settings block (v2/v1 still load)
+ 
+ // ---- serialized structures (POD, packed layout kept stable) ----
+ struct __attribute__((packed)) SaveSynth {
+@@ -64,6 +64,31 @@ static void slotPath(uint8_t slot, char* out, size_t n) {
+     snprintf(out, n, "%s/P%u.gbx", DIR_PROJECTS, (unsigned)(slot + 1));
+ }
+ 
++// v3 appends this block right after the v2 body. reserved[] lets us add more
++// motion settings later without another version bump (0 = default on old v3 files).
++struct __attribute__((packed)) SaveMotion {
++    uint8_t enabled, stutterEnd, probTarget, probMode;
++    uint8_t reserved[12];
++};
++
++#define LAST_SLOT_FILE  DIR_ROOT "/last.dat"
++
++static void writeLastSlot(uint8_t slot) {
++    SD.remove(LAST_SLOT_FILE);
++    File f = SD.open(LAST_SLOT_FILE, FILE_WRITE);
++    if (!f) return;
++    f.write(&slot, 1);
++    f.close();
++}
++
++int storageLastSlot() {
++    File f = SD.open(LAST_SLOT_FILE, FILE_READ);
++    if (!f) return -1;
++    int b = f.read();
++    f.close();
++    return (b >= 0 && b < NUM_PROJECT_SLOTS) ? b : -1;
++}
++
+ bool storageProjectExists(uint8_t slot) {
+     char path[64]; slotPath(slot, path, sizeof(path));
+     return SD.exists(path);
+@@ -110,8 +135,17 @@ bool storageSaveProject(uint8_t slot) {
+     File f = SD.open(path, FILE_WRITE);
+     if (!f) return false;
+     size_t written = f.write((uint8_t*)&pf, sizeof(pf));
++
++    SaveMotion sm = {};
++    sm.enabled    = g_motion.enabled ? 1 : 0;
++    sm.stutterEnd = g_motion.stutterEnd;
++    sm.probTarget = g_motion.probTarget;
++    sm.probMode   = g_motion.probMode;
++    written += f.write((uint8_t*)&sm, sizeof(sm));
+     f.close();
+-    return written == sizeof(pf);
++    bool ok = (written == sizeof(pf) + sizeof(sm));
++    if (ok) writeLastSlot(slot);        // remember it for the next boot
++    return ok;
+ }
+ 
+ // shared param/lane/song apply used by both format loaders
+@@ -153,7 +187,7 @@ bool storageLoadProject(uint8_t slot) {
+     if (f.read(head, 8) != 8) { f.close(); return false; }
+     uint32_t magic;  memcpy(&magic, head, 4);
+     uint16_t version; memcpy(&version, head + 4, 2);
+-    if (magic != GBX_MAGIC || (version != 1 && version != 2)) { f.close(); return false; }
++    if (magic != GBX_MAGIC || version < 1 || version > 3) { f.close(); return false; }
+     f.seek(0);
+ 
+     bool wasPlaying = g_playing;
+@@ -162,15 +196,27 @@ bool storageLoadProject(uint8_t slot) {
+ 
+     samplerClearAll();
+ 
+-    if (version == 2) {
++    if (version >= 2) {                // v2 and v3 share the body; v3 adds a motion block
+         static ProjectFile pf;
+         size_t got = f.read((uint8_t*)&pf, sizeof(pf));
++
++        MotionCfg m = { true, 1, 1, 0 };            // defaults (used for v2, or if block missing)
++        if (got == sizeof(pf) && version >= 3) {
++            SaveMotion sm;
++            if (f.read((uint8_t*)&sm, sizeof(sm)) == sizeof(sm)) {
++                m.enabled    = (sm.enabled != 0);
++                m.stutterEnd = (uint8_t)(sm.stutterEnd & 1);
++                m.probTarget = (uint8_t)(sm.probTarget % 3);
++                m.probMode   = (uint8_t)(sm.probMode & 1);
++            }
++        }
+         f.close();
+         if (got == sizeof(pf)) {
+             g_bpm = pf.bpm;
+             g_songLoopStart = pf.songLoopStart;
+             memcpy(g_song, pf.song, SONG_LENGTH);
+             for (int s = 0; s < NUM_SYNTHS; s++) applySynth(s, pf.synths[s], pf.voices[s]);
++            g_motion = m;                          // v3: loaded block; v2: defaults
+             for (int l = 0; l < NUM_DRUM_LANES; l++) applyLane(l, pf.lanes[l]);
+             for (int p = 0; p < NUM_PATTERNS; p++) {
+                 for (int s = 0; s < NUM_SYNTHS; s++)
+@@ -193,6 +239,7 @@ bool storageLoadProject(uint8_t slot) {
+             g_songLoopStart = pf.songLoopStart;
+             memcpy(g_song, pf.song, SONG_LENGTH);
+             for (int s = 0; s < NUM_SYNTHS; s++) applySynth(s, pf.synths[s], 1);
++            g_motion = { true, 1, 1, 0 };          // v1 has no motion block: defaults
+             for (int l = 0; l < NUM_DRUM_LANES; l++) applyLane(l, pf.lanes[l]);
+             for (int p = 0; p < NUM_PATTERNS; p++) {
+                 for (int s = 0; s < NUM_SYNTHS; s++)
+diff --git a/storage.h b/storage.h
+index d2df79e..810c417 100644
+--- a/storage.h
++++ b/storage.h
+@@ -14,3 +14,6 @@ extern uint8_t g_curProject;    // 0..7
+ bool storageSaveProject(uint8_t slot);
+ bool storageLoadProject(uint8_t slot);
+ bool storageProjectExists(uint8_t slot);
++
++// Slot saved most recently (marker on the SD), or -1 if none / unreadable.
++int  storageLastSlot();
+diff --git a/synth_voice.h b/synth_voice.h
+index 3795585..f1b8f1b 100644
+--- a/synth_voice.h
++++ b/synth_voice.h
+@@ -37,9 +37,9 @@ struct SynthVoice {
+         phase = 0; freq = 0; targetFreq = 0;
+         oscMode = OSC_SAW; wtIndex = 0;
+         fltLP = 0; fltBP = 0;
+-        fltCutoff = 0.4f; fltReso = 0.3f; fltEnvAmt = 0.5f;
++        fltCutoff = 0.4f; fltReso = 0.3f; fltEnvAmt = 0.30f;
+         ampEnv = 0;  ampDecRate  = 0.99985f;
+-        filtEnv = 0; filtDecRate = 0.9996f;
++        filtEnv = 0; filtDecRate = 0.9993f;
+         volume = 0.8f; accent = false; active = false; slideActive = false;
+     }
+ 
+@@ -70,7 +70,7 @@ struct SynthVoice {
+         }
+     }
+ 
+-    inline float render() {
++    inline float render(float cutPos = 0.0f) {
+         if (!active) return 0.0f;
+ 
+         if (slideActive) freq += (targetFreq - freq) * 0.005f;   // ~50 ms glide
+@@ -85,7 +85,13 @@ struct SynthVoice {
+         filtEnv *= filtDecRate;
+         if (ampEnv < 0.002f) { ampEnv = 0; active = false; return 0.0f; }
+ 
+-        float cutMod = fltCutoff + fltEnvAmt * filtEnv;
++        // cutPos: signed tilt position (-1..+1). 0 = keep the track's own cutoff.
++        // >0 sweeps toward fully open, <0 toward shut, anchored at fltCutoff so the
++        // centre is continuous with the SOUND-page value.
++        float base = fltCutoff;
++        if      (cutPos > 0.0f) base = fltCutoff + cutPos * (0.80f - fltCutoff);
++        else if (cutPos < 0.0f) base = fltCutoff + cutPos * (fltCutoff - 0.05f);
++        float cutMod = base + fltEnvAmt * filtEnv;
+         if (accent) cutMod += 0.12f;
+         if (cutMod > 0.8f)  cutMod = 0.8f;
+         if (cutMod < 0.05f) cutMod = 0.05f;
+diff --git a/ui.cpp b/ui.cpp
+index 55731cf..9354576 100644
+--- a/ui.cpp
++++ b/ui.cpp
+@@ -364,6 +364,36 @@ static void drawHelpPage() {
+ }
+ 
+ // ---------- draw dispatch ----------
++static void drawMotionPage() {
++    canvas.setTextColor(COL_TEXT);
++    canvas.setCursor(2, 14);
++    canvas.print("MOTION (IMU)");
++    canvas.setTextColor(g_motion.enabled ? COL_ACCENT : COL_DIM);
++    canvas.setCursor(150, 14);
++    canvas.print(g_motion.enabled ? "ACTIVE" : "OFF");
++
++    const char* names[MOTION_PARAMS] = { "MOTION", "STUTTER", "THIN TRACKS", "THIN MODE" };
++    const char* tgt[3] = { "ALL", "DRUMS", "SYNTHS" };
++    int y = 32;
++    for (int r = 0; r < MOTION_PARAMS; r++) {
++        bool sel = (g_motionParam == r);
++        canvas.setTextColor(sel ? COL_TEXT : COL_DIM);
++        canvas.setCursor(2, y);
++        canvas.printf("%s%-12s", sel ? ">" : " ", names[r]);
++        canvas.setCursor(120, y);
++        switch (r) {
++            case 0: canvas.print(g_motion.enabled ? "ON"  : "OFF");                    break;
++            case 1: canvas.print(g_motion.stutterEnd == 0 ? "AWAY" : "TOWARD YOU"); break;
++            case 2: canvas.print(tgt[g_motion.probTarget % 3]);                        break;
++            case 3: canvas.print(g_motion.probMode == 0 ? "RANDOM" : "LOCKED");        break;
++        }
++        y += 18;
++    }
++    canvas.setTextColor(COL_DIM);
++    canvas.setCursor(2, y + 4);
++    canvas.print("cutoff: tilt left / right");
++}
++
+ void uiDraw() {
+     canvas.fillSprite(COL_BG);
+     drawHeader();
+@@ -371,11 +401,13 @@ void uiDraw() {
+         case PAGE_PATTERN: drawPatternPage();
+             drawFooter("ctl:page /:rec spc:play"); break;
+         case PAGE_SOUND:   drawSoundPage();
+-            drawFooter("v c row  x b adjust  m=fine"); break;
++            drawFooter("^ v row  < > adjust  m=fine"); break;
+         case PAGE_SAMPLE:  drawSamplePage();
+             drawFooter(".:preview  4..-:assign lane"); break;
+         case PAGE_SONG:    drawSongPage();
+             drawFooter("4..-:set z:clr .:loop n:mode"); break;
++        case PAGE_MOTION:  drawMotionPage();
++            drawFooter("^ v row   < > change"); break;
+         default:           drawHelpPage();
+             drawFooter("MICROGROOVE"); break;
+     }

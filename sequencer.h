@@ -68,10 +68,10 @@ struct SynthTrack {
         v[pick].noteOn(freq, acc, false);                  // no slide in poly
     }
 
-    inline float render() {
-        if (voices <= 1) return v[0].render();
+    inline float render(float cutPos = 0.0f) {
+        if (voices <= 1) return v[0].render(cutPos);
         float s = 0;
-        for (int i = 0; i < voices; i++) s += v[i].render();
+        for (int i = 0; i < voices; i++) s += v[i].render(cutPos);
         return s * (voices > 2 ? 0.62f : 0.75f);           // headroom vs. clip
     }
 };
@@ -88,8 +88,8 @@ extern uint8_t    g_songLoopStart;
 
 extern SynthTrack g_synths[NUM_SYNTHS];
 extern DrumLane   g_drumLanes[NUM_DRUM_LANES];
-extern bool       g_synthMute[NUM_SYNTHS];
-extern bool       g_drumMute;
+extern volatile bool g_synthMute[NUM_SYNTHS];
+extern volatile bool g_drumMute;
 
 // transport
 extern volatile bool g_playing;
@@ -99,6 +99,19 @@ extern uint8_t    g_playStep;
 extern uint8_t    g_playPattern;    // pattern currently sounding
 extern uint8_t    g_songPos;
 extern uint16_t   g_bpm;
+extern uint8_t    g_stutterRate;    // 0 = off, 1 = 1/8, 2 = 1/16, 3 = 1/32 (set from IMU tilt)
+extern uint8_t    g_stepProb;       // % a normal step fires (100 = always); tilt-back thins
+
+// Motion / IMU performance config (edited on the MOTION page, RAM for now).
+struct MotionCfg {
+    bool    enabled;      // master on/off for all IMU control
+    uint8_t stutterEnd;   // 0 = FWD, 1 = BACK  (which tilt end is the stutter; other end = prob)
+    uint8_t probTarget;   // 0 = ALL, 1 = DRUM, 2 = SYNTH
+    uint8_t probMode;     // 0 = RND (per step), 1 = BAR (locked per step index)
+};
+extern MotionCfg  g_motion;
+extern uint8_t    g_motionParam;    // cursor row on the MOTION page
+#define MOTION_PARAMS 4
 
 // edit state
 extern uint8_t    g_curPattern;     // pattern being edited/viewed

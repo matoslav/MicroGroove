@@ -11,8 +11,8 @@ uint8_t    g_songLoopStart = 0;
 
 SynthTrack g_synths[NUM_SYNTHS];
 DrumLane   g_drumLanes[NUM_DRUM_LANES];
-bool       g_synthMute[NUM_SYNTHS] = {false, false, false};
-bool       g_drumMute = false;
+volatile bool g_synthMute[NUM_SYNTHS] = {false, false, false};
+volatile bool g_drumMute = false;
 
 volatile bool g_playing = false;
 bool       g_recEnabled = false;
@@ -21,6 +21,11 @@ uint8_t    g_playStep    = 0;
 uint8_t    g_playPattern = 0;
 uint8_t    g_songPos     = 0;
 uint16_t   g_bpm         = 128;
+uint8_t    g_stutterRate = 0;      // 0 = off, 1 = 1/8, 2 = 1/16, 3 = 1/32 (from tilt)
+uint8_t    g_stepProb    = 100;    // % chance a normal step fires (100 = always); tilt-back thins
+
+MotionCfg  g_motion = { true, 1, 1, 0 };   // enabled, stutter=TOWARD YOU, thin=DRUMS, mode=RANDOM
+uint8_t    g_motionParam = 0;
 
 uint8_t    g_curPattern  = 0;
 uint8_t    g_curTrack    = 0;
@@ -40,7 +45,7 @@ void sequencerInit() {
 
     for (int s = 0; s < NUM_SYNTHS; s++) g_synths[s].init();
     g_synths[0].forEach([](SynthVoice& v){ v.oscMode = OSC_SAW; v.fltCutoff = 0.30f;
-                                           v.fltReso = 0.45f;   v.fltEnvAmt = 0.60f; });
+                                           v.fltReso = 0.45f;   v.fltEnvAmt = 0.35f; });
     g_synths[1].forEach([](SynthVoice& v){ v.oscMode = OSC_SQR; v.fltCutoff = 0.45f;
                                            v.volume  = 0.6f; });
     g_synths[2].forEach([](SynthVoice& v){ v.oscMode = OSC_WT;  v.wtIndex = 0;
@@ -73,9 +78,10 @@ static void triggerLane(uint8_t lane) {
     g_drumLanes[lane].trigger();
 }
 
-static void triggerStep(uint8_t step) {
-    Pattern& p = g_patterns[g_playPattern];
+static void triggerStep(uint8_t step, uint8_t pat, bool dropSynth = false, bool dropDrum = false) {
+    Pattern& p = g_patterns[pat];
 
+    if (!dropSynth)
     for (int s = 0; s < NUM_SYNTHS; s++) {
         if (g_synthMute[s]) continue;
         const SynthCell& c = p.synth[s][step];
@@ -86,7 +92,7 @@ static void triggerStep(uint8_t step) {
                                    c.accent, mono && c.slide);
     }
 
-    if (!g_drumMute) {
+    if (!dropDrum && !g_drumMute) {
         uint8_t mask = p.drums[step];
         for (int l = 0; l < NUM_DRUM_LANES; l++)
             if (mask & (1 << l)) triggerLane(l);
@@ -124,20 +130,106 @@ static void songAdvance() {
     // fallback: stay on current
 }
 
+// A step is worth repeating if any un-muted track actually sounds on it.
+static bool stepSounds(const Pattern& p, uint8_t step) {
+    for (int s = 0; s < NUM_SYNTHS; s++)
+        if (!g_synthMute[s] && !p.synth[s][step].empty()) return true;
+    if (!g_drumMute && p.drums[step]) return true;
+    return false;
+}
+
+// Probability gate for normal playback (tilt thinning). true = let the step fire.
+static bool stepKeeps(uint8_t step) {
+    if (g_stepProb >= 100) return true;
+    if (g_motion.probMode == 1) {                 // BAR: deterministic per step index
+        uint32_t h = step * 2654435761u;          // cheap hash -> stable 0..99 per step
+        return (uint8_t)((h >> 24) % 100) < g_stepProb;
+    }
+    static bool seeded = false;                    // RND: fresh roll each step
+    if (!seeded) { randomSeed(micros()); seeded = true; }
+    return (long)random(100) < (long)g_stepProb;
+}
+
+// Fire a normal (non-stutter) step, thinning only the targeted tracks.
+static void triggerNormal(uint8_t step, uint8_t pat) {
+    bool drop = !stepKeeps(step);
+    bool dropSyn = drop && (g_motion.probTarget == 0 || g_motion.probTarget == 2);
+    bool dropDrm = drop && (g_motion.probTarget == 0 || g_motion.probTarget == 1);
+    triggerStep(step, pat, dropSyn, dropDrm);
+}
+
 void sequencerTick() {
     if (!g_playing) return;
-    uint32_t now = micros();
-    if (now - s_lastStepUs < s_stepPeriod()) return;
-    s_lastStepUs += s_stepPeriod();                 // accumulate: no drift
 
-    triggerStep(g_playStep);
-    g_playStep++;
-    if (g_playStep >= NUM_STEPS) {
-        g_playStep = 0;
-        if (g_songMode) songAdvance();
-        else            g_playPattern = g_curPattern;  // pattern switch on bar
+    // Stutter release behaviour:
+    //   true  = "to tempo"  : the groove keeps running underneath (silent) while you
+    //                         stutter, so on release it resumes where it would have been.
+    //   false = "freeze"    : hold on the slice; on release continue from that point.
+    const bool STUTTER_TO_TEMPO = true;
+
+    static uint8_t  s_stutterStep   = 0;
+    static uint8_t  s_stutterPat    = 0;
+    static bool     s_wasStuttering = false;
+    static uint32_t s_lastStutterUs = 0;
+
+    uint8_t r = g_stutterRate;                       // 0 off, 1=1/8, 2=1/16, 3=1/32
+    bool stuttering = (r != 0);
+
+    if (stuttering && !s_wasStuttering) {            // just engaged: latch a sounding step
+        Pattern& p = g_patterns[g_playPattern];
+        uint8_t st = (g_playStep == 0) ? (NUM_STEPS - 1) : (g_playStep - 1);  // last played
+        for (int i = 0; i < NUM_STEPS; i++) {        // walk back until one actually sounds
+            if (stepSounds(p, st)) break;
+            st = (st == 0) ? (NUM_STEPS - 1) : (st - 1);
+        }
+        s_stutterStep   = st;
+        s_stutterPat    = g_playPattern;             // latch pattern too (stable across song changes)
+        s_lastStutterUs = s_lastStepUs;              // phase-align to the grid: no stumble on entry
     }
-    g_needRedraw = true;
+    s_wasStuttering = stuttering;
+
+    uint32_t now = micros();
+    uint32_t sp  = s_stepPeriod();                   // stutter repeat period
+    if      (r == 1) sp *= 2;                        // 1/8
+    else if (r == 3) sp /= 2;                        // 1/32
+
+    if (STUTTER_TO_TEMPO) {
+        // (1) real song clock: always advances on the 1/16 grid; audible only when
+        //     not stuttering, so the timeline keeps its place underneath.
+        if (now - s_lastStepUs >= s_stepPeriod()) {
+            s_lastStepUs += s_stepPeriod();
+            if (!stuttering) triggerNormal(g_playStep, g_playPattern);
+            g_playStep++;
+            if (g_playStep >= NUM_STEPS) {
+                g_playStep = 0;
+                if (g_songMode) songAdvance();
+                else            g_playPattern = g_curPattern;
+            }
+            g_needRedraw = true;
+        }
+        // (2) stutter sub-clock: repeat the latched slice at the chosen rate.
+        if (stuttering && now - s_lastStutterUs >= sp) {
+            s_lastStutterUs += sp;
+            triggerStep(s_stutterStep, s_stutterPat);
+        }
+    } else {
+        // freeze variant: hold the slice, don't advance the timeline.
+        uint32_t period = stuttering ? sp : s_stepPeriod();
+        if (now - s_lastStepUs < period) return;
+        s_lastStepUs += period;
+        if (stuttering) {
+            triggerStep(s_stutterStep, s_stutterPat);
+        } else {
+            triggerNormal(g_playStep, g_playPattern);
+            g_playStep++;
+            if (g_playStep >= NUM_STEPS) {
+                g_playStep = 0;
+                if (g_songMode) songAdvance();
+                else            g_playPattern = g_curPattern;
+            }
+        }
+        g_needRedraw = true;
+    }
 }
 
 // ---------- live input ----------

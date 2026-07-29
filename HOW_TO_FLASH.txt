@@ -1,0 +1,17 @@
+MICROGROOVE — flashing from the Arduino IDE
+
+1. Unzip this folder somewhere. The folder MUST stay named "Microgroove"
+   (it has to match Microgroove.ino).
+2. In Arduino IDE: install ESP32 board support (Boards Manager -> "esp32" by
+   Espressif) and the M5Cardputer library (Library Manager -> "M5Cardputer";
+   it pulls in M5Unified / M5GFX).
+3. Open Microgroove.ino.
+4. Select board: M5Cardputer  (or "ESP32S3 Dev Module" with
+   USB CDC On Boot = Enabled).
+5. Click Upload.
+
+Then copy the factory SD contents (Microgroove_SD_card.zip, in this release)
+onto a FAT32 microSD. Power on -> hold LOAD -> tap SONG -> PLAY.
+No SD card? Hold LOAD + SAVE together for a built-in demo.
+
+Full manual: https://github.com/matoslav/MicroGroove/blob/main/docs/USER_MANUAL.md

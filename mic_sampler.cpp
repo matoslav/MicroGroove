@@ -4,6 +4,7 @@
 #include "mic_sampler.h"
 #include "sampler.h"
 #include "sequencer.h"
+#include "audio_engine.h"
 #include "ui.h"
 #include <M5Cardputer.h>
 #include <SD.h>
@@ -71,8 +72,37 @@ static bool writeWav(const char* name, uint32_t start, uint32_t frames, uint32_t
 static bool commitToLane(uint8_t lane, const char* base, uint8_t& counter,
                          uint32_t start, uint32_t frames, uint32_t rate) {
     if (frames < 64) { uiStatus("TOO QUIET"); return false; }
+    // Find the next free NNxx.wav on the SD so a reboot (which resets `counter`)
+    // never overwrites recordings from an earlier session.
     char name[SAMPLE_NAME_LEN];
-    snprintf(name, sizeof(name), "%s%02u.wav", base, (unsigned)(++counter));
+    char probe[80];
+    do {
+        snprintf(name, sizeof(name), "%s%02u.wav", base, (unsigned)(++counter));
+        snprintf(probe, sizeof(probe), "%s/%s", DIR_SAMPLES, name);
+    } while (SD.exists(probe) && counter < 99);
+
+    // Normalize: quiet mic captures otherwise become quiet samples. Amplify the
+    // peak toward ~-1 dBFS, only ever boosting (never attenuating a hot resample)
+    // and with a ceiling so a near-silent take doesn't turn its hiss into a roar.
+    {
+        int32_t pk = 0;
+        for (uint32_t i = 0; i < frames; i++) {
+            int32_t a = g_scratch[start + i]; if (a < 0) a = -a;
+            if (a > pk) pk = a;
+        }
+        if (pk > 0) {
+            float g = (0.9f * 32767.0f) / (float)pk;
+            if (g > 8.0f) g = 8.0f;                 // +18 dB ceiling
+            if (g > 1.0f) {
+                for (uint32_t i = 0; i < frames; i++) {
+                    int32_t v = (int32_t)(g_scratch[start + i] * g);
+                    if      (v >  32767) v =  32767;
+                    else if (v < -32768) v = -32768;
+                    g_scratch[start + i] = (int16_t)v;
+                }
+            }
+        }
+    }
 
     int slot = -1;
     if (writeWav(name, start, frames, rate)) {
@@ -99,6 +129,9 @@ static bool commitToLane(uint8_t lane, const char* base, uint8_t& counter,
 bool micRecStart(uint8_t lane) {
     if (s_recActive || !g_scratch) return false;
     sequencerStop();
+    g_previewVoice.stop();              // preview shares the scratch buffer we're about to fill
+    g_audioPaused = true;               // stop the render task touching the codec first
+    for (int i = 0; i < 100 && !g_audioParked; i++) vTaskDelay(1);
     M5Cardputer.Speaker.end();          // ES8311: avoid duplex contention (verify on hw)
     M5Cardputer.Mic.begin();
     s_recLane = lane; s_recActive = true;
@@ -153,6 +186,7 @@ void micRecStop() {
     trimScratch(g_scratchWr, MIC_RATE, start, len);
     if (commitToLane(s_recLane, "MIC", s_micCount, start, len, MIC_RATE))
         uiStatus("SAMPLED!");
+    g_audioPaused = false;              // codec + sample pool are stable now, resume audio
     g_needRedraw = true;
 }
 

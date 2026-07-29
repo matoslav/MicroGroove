@@ -9,6 +9,7 @@
 //                         then tap a pad to commit
 // ============================================================
 #include <M5Cardputer.h>
+#include <SD.h>
 #include "config.h"
 #include "keymap.h"
 #include "sequencer.h"
@@ -17,12 +18,58 @@
 #include "wavetable.h"
 #include "ui.h"
 #include "mic_sampler.h"
+#include "audio_engine.h"
 
 void inputInit();
 void inputUpdate();
 
 #define LONG_PRESS_MS 450
 #define HINT_AFTER_MS 140    // progress bar appears after this
+
+// Unload every sample from the RAM pool (SAMPLE page: CL / Z). The .wav files
+// stay on the SD. Any drum lane that was playing a sample is detached first so
+// the render task never reads freed pool data. Audio is parked during the swap.
+static void clearSampleRAM() {
+    g_audioPaused = true;
+    for (int i = 0; i < 100 && !g_audioParked; i++) vTaskDelay(1);
+    g_previewVoice.stop();
+    for (int d = 0; d < NUM_DRUM_LANES; d++)
+        if (g_drumLanes[d].engine == ENG_SMPL) {
+            g_drumLanes[d].smp.stop();
+            g_drumLanes[d].sampleSlot = -1;
+        }
+    samplerClearAll();                 // pool usage -> 0, registry wiped
+    g_audioPaused = false;
+    uiStatus("RAM CLEARED");
+}
+
+// Audition a sample WITHOUT touching the shared pool: decode it into the
+// temporary mic/resample scratch buffer and point the preview voice there.
+// Previewing another sample just overwrites the scratch, so auditioning never
+// fills RAM. Only assigning a sample to a lane (4..- keys) consumes the pool.
+static void previewSample(const char* name) {
+    if (!g_scratch) { uiStatus("NO PREVIEW BUF"); return; }
+    char path[80];
+    snprintf(path, sizeof(path), "%s/%s", DIR_SAMPLES, name);
+    File f = SD.open(path, FILE_READ);
+    if (!f) { uiStatus("LOAD FAILED"); return; }
+
+    g_previewVoice.active = false;                 // stop reading scratch during the swap
+    uint32_t frames = 0, rate = 0;
+    bool ok = wavDecodeToMono16(f, g_scratch, SCRATCH_FRAMES, frames, rate);
+    f.close();
+
+    if (ok && frames) {
+        g_previewVoice.data = g_scratch;
+        g_previewVoice.len  = frames;
+        g_previewVoice.pos  = 0;
+        g_previewVoice.inc  = (float)rate * INV_SAMPLE_RATE;
+        g_previewVoice.gain = 0.9f;
+        g_previewVoice.active = true;              // set active last
+    } else {
+        uiStatus("LOAD FAILED");
+    }
+}
 #define RPT_DELAY_MS  350
 #define RPT_RATE_MS    90
 
@@ -114,6 +161,15 @@ static void adjustDrumParam(uint8_t lane, uint8_t row, int dir, bool fine) {
 }
 
 // ---------- arrows, per page ----------
+static void adjustMotionParam(uint8_t row, int dx) {
+    switch (row) {
+        case 0: g_motion.enabled = !g_motion.enabled;                 break;  // MOTION on/off
+        case 1: g_motion.stutterEnd ^= 1;                             break;  // STU END FWD/BACK
+        case 2: g_motion.probTarget = (uint8_t)((g_motion.probTarget + 3 + (dx > 0 ? 1 : -1)) % 3); break;
+        case 3: g_motion.probMode ^= 1;                               break;  // RND/BAR
+    }
+}
+
 static void arrow(uint8_t act, const KeySnap& now) {
     int dx = (act == ACT_LEFT) ? -1 : (act == ACT_RIGHT) ? 1 : 0;
     int dy = (act == ACT_UP)   ? -1 : (act == ACT_DOWN)  ? 1 : 0;
@@ -157,6 +213,11 @@ static void arrow(uint8_t act, const KeySnap& now) {
         case PAGE_SONG:
             if (dy) g_songCursor = (uint8_t)((g_songCursor + SONG_LENGTH + dy * 16) % SONG_LENGTH);
             if (dx) g_songCursor = (uint8_t)((g_songCursor + SONG_LENGTH + dx) % SONG_LENGTH);
+            break;
+
+        case PAGE_MOTION:
+            if (dy) g_motionParam = (uint8_t)((g_motionParam + MOTION_PARAMS + dy) % MOTION_PARAMS);
+            if (dx) adjustMotionParam(g_motionParam, dx);
             break;
         default: break;
     }
@@ -206,7 +267,12 @@ static void doShort(uint8_t act) {
                 int slot = samplerLoad(g_fileList[g_fileSel]);
                 if (slot >= 0) {
                     DrumLane& d = g_drumLanes[k];
+                    g_audioPaused = true;                 // swap lane state atomically vs render task
+                    for (int i = 0; i < 100 && !g_audioParked; i++) vTaskDelay(1);
+                    d.sv.active  = false;                 // silence old synth-drum voice
+                    d.smp.stop();                         // silence old sample voice
                     d.engine = ENG_SMPL; d.sampleSlot = (int8_t)slot; d.smp.init();
+                    g_audioPaused = false;
                     uiStatus("ASSIGNED");
                 } else uiStatus("LOAD FAILED");
                 g_needRedraw = true;
@@ -252,8 +318,9 @@ static void doShort(uint8_t act) {
             g_needRedraw = true; break;
 
         case ACT_CLR:
-            if (g_curPage == PAGE_SONG) g_song[g_songCursor] = SONG_EMPTY;
-            else clearCellAtCursor();
+            if (g_curPage == PAGE_SAMPLE)    clearSampleRAM();
+            else if (g_curPage == PAGE_SONG) g_song[g_songCursor] = SONG_EMPTY;
+            else                             clearCellAtCursor();
             g_needRedraw = true; break;
 
         case ACT_SONG:
@@ -263,9 +330,7 @@ static void doShort(uint8_t act) {
 
         case ACT_AUX:
             if (g_curPage == PAGE_SAMPLE && g_fileCount) {
-                int slot = samplerLoad(g_fileList[g_fileSel]);
-                if (slot >= 0) g_previewVoice.trigger(slot, 1.0f, 0.9f);
-                else uiStatus("LOAD FAILED");
+                previewSample(g_fileList[g_fileSel]);
                 g_needRedraw = true;
             } else if (g_curPage == PAGE_SONG) {
                 g_songLoopStart = g_songCursor;
@@ -312,6 +377,7 @@ static void doLong(uint8_t act) {
         case ACT_PLAY:
             sequencerStart(true); g_needRedraw = true; break;
         case ACT_CLR:
+            if (g_curPage == PAGE_SAMPLE) break;      // Z here = clear RAM (short press), never wipe pattern
             memset(&g_patterns[g_curPattern], 0, sizeof(Pattern));
             uiStatus("PATTERN CLEARED"); g_needRedraw = true; break;
         case ACT_BPM_DN:

@@ -11,7 +11,7 @@
 uint8_t g_curProject = 0;
 
 #define GBX_MAGIC   0x31584247u   // "GBX1"
-#define GBX_VERSION 2             // v2: polyphonic cells + per-track VOICES
+#define GBX_VERSION 3             // v3: + motion/IMU settings block (v2/v1 still load)
 
 // ---- serialized structures (POD, packed layout kept stable) ----
 struct __attribute__((packed)) SaveSynth {
@@ -64,6 +64,31 @@ static void slotPath(uint8_t slot, char* out, size_t n) {
     snprintf(out, n, "%s/P%u.gbx", DIR_PROJECTS, (unsigned)(slot + 1));
 }
 
+// v3 appends this block right after the v2 body. reserved[] lets us add more
+// motion settings later without another version bump (0 = default on old v3 files).
+struct __attribute__((packed)) SaveMotion {
+    uint8_t enabled, stutterEnd, probTarget, probMode;
+    uint8_t reserved[12];
+};
+
+#define LAST_SLOT_FILE  DIR_ROOT "/last.dat"
+
+static void writeLastSlot(uint8_t slot) {
+    SD.remove(LAST_SLOT_FILE);
+    File f = SD.open(LAST_SLOT_FILE, FILE_WRITE);
+    if (!f) return;
+    f.write(&slot, 1);
+    f.close();
+}
+
+int storageLastSlot() {
+    File f = SD.open(LAST_SLOT_FILE, FILE_READ);
+    if (!f) return -1;
+    int b = f.read();
+    f.close();
+    return (b >= 0 && b < NUM_PROJECT_SLOTS) ? b : -1;
+}
+
 bool storageProjectExists(uint8_t slot) {
     char path[64]; slotPath(slot, path, sizeof(path));
     return SD.exists(path);
@@ -110,8 +135,17 @@ bool storageSaveProject(uint8_t slot) {
     File f = SD.open(path, FILE_WRITE);
     if (!f) return false;
     size_t written = f.write((uint8_t*)&pf, sizeof(pf));
+
+    SaveMotion sm = {};
+    sm.enabled    = g_motion.enabled ? 1 : 0;
+    sm.stutterEnd = g_motion.stutterEnd;
+    sm.probTarget = g_motion.probTarget;
+    sm.probMode   = g_motion.probMode;
+    written += f.write((uint8_t*)&sm, sizeof(sm));
     f.close();
-    return written == sizeof(pf);
+    bool ok = (written == sizeof(pf) + sizeof(sm));
+    if (ok) writeLastSlot(slot);        // remember it for the next boot
+    return ok;
 }
 
 // shared param/lane/song apply used by both format loaders
@@ -153,7 +187,7 @@ bool storageLoadProject(uint8_t slot) {
     if (f.read(head, 8) != 8) { f.close(); return false; }
     uint32_t magic;  memcpy(&magic, head, 4);
     uint16_t version; memcpy(&version, head + 4, 2);
-    if (magic != GBX_MAGIC || (version != 1 && version != 2)) { f.close(); return false; }
+    if (magic != GBX_MAGIC || version < 1 || version > 3) { f.close(); return false; }
     f.seek(0);
 
     bool wasPlaying = g_playing;
@@ -162,15 +196,27 @@ bool storageLoadProject(uint8_t slot) {
 
     samplerClearAll();
 
-    if (version == 2) {
+    if (version >= 2) {                // v2 and v3 share the body; v3 adds a motion block
         static ProjectFile pf;
         size_t got = f.read((uint8_t*)&pf, sizeof(pf));
+
+        MotionCfg m = { true, 1, 1, 0 };            // defaults (used for v2, or if block missing)
+        if (got == sizeof(pf) && version >= 3) {
+            SaveMotion sm;
+            if (f.read((uint8_t*)&sm, sizeof(sm)) == sizeof(sm)) {
+                m.enabled    = (sm.enabled != 0);
+                m.stutterEnd = (uint8_t)(sm.stutterEnd & 1);
+                m.probTarget = (uint8_t)(sm.probTarget % 3);
+                m.probMode   = (uint8_t)(sm.probMode & 1);
+            }
+        }
         f.close();
         if (got == sizeof(pf)) {
             g_bpm = pf.bpm;
             g_songLoopStart = pf.songLoopStart;
             memcpy(g_song, pf.song, SONG_LENGTH);
             for (int s = 0; s < NUM_SYNTHS; s++) applySynth(s, pf.synths[s], pf.voices[s]);
+            g_motion = m;                          // v3: loaded block; v2: defaults
             for (int l = 0; l < NUM_DRUM_LANES; l++) applyLane(l, pf.lanes[l]);
             for (int p = 0; p < NUM_PATTERNS; p++) {
                 for (int s = 0; s < NUM_SYNTHS; s++)
@@ -193,6 +239,7 @@ bool storageLoadProject(uint8_t slot) {
             g_songLoopStart = pf.songLoopStart;
             memcpy(g_song, pf.song, SONG_LENGTH);
             for (int s = 0; s < NUM_SYNTHS; s++) applySynth(s, pf.synths[s], 1);
+            g_motion = { true, 1, 1, 0 };          // v1 has no motion block: defaults
             for (int l = 0; l < NUM_DRUM_LANES; l++) applyLane(l, pf.lanes[l]);
             for (int p = 0; p < NUM_PATTERNS; p++) {
                 for (int s = 0; s < NUM_SYNTHS; s++)
