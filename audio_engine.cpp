@@ -12,6 +12,12 @@
 float g_scopeBuf[SCREEN_W];
 volatile int g_scopeIdx = 0;
 
+volatile bool g_audioPaused = false;
+volatile bool g_audioParked = false;
+
+volatile float g_motionCut = 0.0f;
+volatile int   g_motionTrack = -1;
+
 static int16_t s_bufA[AUDIO_BUF_LEN];
 static int16_t s_bufB[AUDIO_BUF_LEN];
 static TaskHandle_t s_task = nullptr;
@@ -21,13 +27,16 @@ static void audioTask(void*) {
     int cur = 0;
 
     while (true) {
+        if (g_audioPaused) { g_audioParked = true; vTaskDelay(2); continue; }
+        g_audioParked = false;
         int16_t* buf = buffers[cur];
 
         for (int i = 0; i < AUDIO_BUF_LEN; i++) {
             float mix = 0.0f;
 
             for (int s = 0; s < NUM_SYNTHS; s++)
-                if (!g_synthMute[s]) mix += g_synths[s].render();   // SynthTrack: sums 1..3 voices
+                if (!g_synthMute[s])
+                    mix += g_synths[s].render(s == g_motionTrack ? g_motionCut : 0.0f);
 
             if (!g_drumMute)
                 for (int d = 0; d < NUM_DRUM_LANES; d++)

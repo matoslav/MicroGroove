@@ -57,7 +57,7 @@ enum DrumEngine : uint8_t { ENG_808 = 0, ENG_909, ENG_SMPL, ENG_COUNT };
 enum DrumType : uint8_t { DT_KICK = 0, DT_SNARE, DT_HAT_C, DT_HAT_O_OR_CLAP, DT_COUNT };
 // 808 set: KICK SNARE CHAT CLAP  |  909 set: KICK SNARE CHAT OHAT
 
-enum Page : uint8_t { PAGE_PATTERN = 0, PAGE_SOUND, PAGE_SAMPLE, PAGE_SONG, PAGE_HELP, PAGE_COUNT };
+enum Page : uint8_t { PAGE_PATTERN = 0, PAGE_SOUND, PAGE_SAMPLE, PAGE_SONG, PAGE_MOTION, PAGE_HELP, PAGE_COUNT };
 
 // note values 1..12 = C..B, 0 = empty
 #define NOTE_EMPTY 0

@@ -14,3 +14,6 @@ extern uint8_t g_curProject;    // 0..7
 bool storageSaveProject(uint8_t slot);
 bool storageLoadProject(uint8_t slot);
 bool storageProjectExists(uint8_t slot);
+
+// Slot saved most recently (marker on the SD), or -1 if none / unreadable.
+int  storageLastSlot();

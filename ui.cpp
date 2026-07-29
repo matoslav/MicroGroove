@@ -364,6 +364,36 @@ static void drawHelpPage() {
 }
 
 // ---------- draw dispatch ----------
+static void drawMotionPage() {
+    canvas.setTextColor(COL_TEXT);
+    canvas.setCursor(2, 14);
+    canvas.print("MOTION (IMU)");
+    canvas.setTextColor(g_motion.enabled ? COL_ACCENT : COL_DIM);
+    canvas.setCursor(150, 14);
+    canvas.print(g_motion.enabled ? "ACTIVE" : "OFF");
+
+    const char* names[MOTION_PARAMS] = { "MOTION", "STUTTER", "THIN TRACKS", "THIN MODE" };
+    const char* tgt[3] = { "ALL", "DRUMS", "SYNTHS" };
+    int y = 32;
+    for (int r = 0; r < MOTION_PARAMS; r++) {
+        bool sel = (g_motionParam == r);
+        canvas.setTextColor(sel ? COL_TEXT : COL_DIM);
+        canvas.setCursor(2, y);
+        canvas.printf("%s%-12s", sel ? ">" : " ", names[r]);
+        canvas.setCursor(120, y);
+        switch (r) {
+            case 0: canvas.print(g_motion.enabled ? "ON"  : "OFF");                    break;
+            case 1: canvas.print(g_motion.stutterEnd == 0 ? "AWAY" : "TOWARD YOU"); break;
+            case 2: canvas.print(tgt[g_motion.probTarget % 3]);                        break;
+            case 3: canvas.print(g_motion.probMode == 0 ? "RANDOM" : "LOCKED");        break;
+        }
+        y += 18;
+    }
+    canvas.setTextColor(COL_DIM);
+    canvas.setCursor(2, y + 4);
+    canvas.print("cutoff: tilt left / right");
+}
+
 void uiDraw() {
     canvas.fillSprite(COL_BG);
     drawHeader();
@@ -371,11 +401,13 @@ void uiDraw() {
         case PAGE_PATTERN: drawPatternPage();
             drawFooter("ctl:page /:rec spc:play"); break;
         case PAGE_SOUND:   drawSoundPage();
-            drawFooter("v c row  x b adjust  m=fine"); break;
+            drawFooter("^ v row  < > adjust  m=fine"); break;
         case PAGE_SAMPLE:  drawSamplePage();
             drawFooter(".:preview  4..-:assign lane"); break;
         case PAGE_SONG:    drawSongPage();
             drawFooter("4..-:set z:clr .:loop n:mode"); break;
+        case PAGE_MOTION:  drawMotionPage();
+            drawFooter("^ v row   < > change"); break;
         default:           drawHelpPage();
             drawFooter("MICROGROOVE"); break;
     }

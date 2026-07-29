@@ -37,9 +37,9 @@ struct SynthVoice {
         phase = 0; freq = 0; targetFreq = 0;
         oscMode = OSC_SAW; wtIndex = 0;
         fltLP = 0; fltBP = 0;
-        fltCutoff = 0.4f; fltReso = 0.3f; fltEnvAmt = 0.5f;
+        fltCutoff = 0.4f; fltReso = 0.3f; fltEnvAmt = 0.30f;
         ampEnv = 0;  ampDecRate  = 0.99985f;
-        filtEnv = 0; filtDecRate = 0.9996f;
+        filtEnv = 0; filtDecRate = 0.9993f;
         volume = 0.8f; accent = false; active = false; slideActive = false;
     }
 
@@ -70,7 +70,7 @@ struct SynthVoice {
         }
     }
 
-    inline float render() {
+    inline float render(float cutPos = 0.0f) {
         if (!active) return 0.0f;
 
         if (slideActive) freq += (targetFreq - freq) * 0.005f;   // ~50 ms glide
@@ -85,7 +85,13 @@ struct SynthVoice {
         filtEnv *= filtDecRate;
         if (ampEnv < 0.002f) { ampEnv = 0; active = false; return 0.0f; }
 
-        float cutMod = fltCutoff + fltEnvAmt * filtEnv;
+        // cutPos: signed tilt position (-1..+1). 0 = keep the track's own cutoff.
+        // >0 sweeps toward fully open, <0 toward shut, anchored at fltCutoff so the
+        // centre is continuous with the SOUND-page value.
+        float base = fltCutoff;
+        if      (cutPos > 0.0f) base = fltCutoff + cutPos * (0.80f - fltCutoff);
+        else if (cutPos < 0.0f) base = fltCutoff + cutPos * (fltCutoff - 0.05f);
+        float cutMod = base + fltEnvAmt * filtEnv;
         if (accent) cutMod += 0.12f;
         if (cutMod > 0.8f)  cutMod = 0.8f;
         if (cutMod < 0.05f) cutMod = 0.05f;
